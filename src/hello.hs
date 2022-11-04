@@ -6,10 +6,11 @@
 module Main where
 
 import Control.Concurrent (forkFinally)
-import Control.Exception (bracket, bracketOnError)
+import Control.Exception (bracket, bracketOnError, try, SomeException)
 import Control.Monad (forever, void)
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
 import Data.Default (Default(def))
 import System.Exit (ExitCode(ExitFailure, ExitSuccess))
 
@@ -50,6 +51,7 @@ import NixProtocol
   , handleOneOpcode
   , newConnection
   , sendMessage
+  , stderrLast
   )
 import qualified NixProtocol
 import SocketDuplex ()
@@ -69,9 +71,9 @@ data Ident =
 
 main :: IO ()
 main
-  -- ssh-keygen -t ed25519 -f ssh-host-key -N ''
  = do
   file <- BS.readFile "ssh-host-key"
+  -- ssh-keygen -t ed25519 -f ssh-host-key -N ''
   (privateKey, _):_ <-
     decodePrivateKeyFile BS.empty file :: IO [(KeyPair, BA.Bytes)]
   print privateKey
@@ -99,6 +101,7 @@ main
             Data.Default.def
               { Server.onSessionRequest = handleSessionRequest
               , Server.onDirectTcpIpRequest = handleDirectTcpIpRequest
+              , Server.channelMaxQueueSize = 64 * 1024
               }
         }
     open = S.socket :: IO (S.Socket S.Inet6 S.Stream S.Default)
@@ -235,36 +238,43 @@ handleSessionRequest ::
 handleSessionRequest _idnt _req =
   pure $
   Just $
-  Server.SessionHandler $ \_ _ _ stdin stdout _ -> do
-    conn <- newConnection stdin stdout
-    eResult <-
-      runExceptT $ do
-        clientVersion <- NixProtocol.handshake conn
-        sendMessage conn $ NixInt stderrLast
-        liftIO $ do fprint ("client with " % sh % " connected\n") clientVersion
-        pure "handshake done"
-    case eResult of
+  Server.SessionHandler $ \_env _terminfo _command stdin stdout stderr -> do
+    eFinalResult <- try $ do
+      conn <- newConnection stdin stdout
+      eResult <-
+        runExceptT $ do
+          clientVersion <- NixProtocol.handshake conn
+          sendMessage conn $ NixInt stderrLast
+          liftIO $ do fprint ("client with " % sh % " connected\n") clientVersion
+          pure "handshake done"
+      case eResult of
+        Left err -> do
+          print err
+          pure $ ExitFailure 1
+        Right success -> do
+          print @T.Text success
+          eMainLoopError <-
+            runExceptT $ do
+              forever $ handleOneOpcode conn
+              pure "done main loop"
+          case eMainLoopError of
+            Left err -> do
+              fprint ("main loop error: " % sh % "\n") err
+              _ <- runExceptT $ do
+                sendMessage conn $ StdErrError 1 $ T.pack $ show err
+                sendMessage conn $ NixInt stderrLast
+              pure $ ExitFailure 1
+            Right success' -> do
+              fprint ("main loop finished without error: " % sh @T.Text % "\n") success'
+              _ <- runExceptT $ do
+                sendMessage conn $ NixInt stderrLast
+              pure ExitSuccess
+    case eFinalResult of
       Left err -> do
-        print err
+        print @SomeException err
+        sendAll stderr $ BSC.pack $ show err
         pure $ ExitFailure 1
-      Right success -> do
-        print @T.Text success
-        eMainLoopError <-
-          runExceptT $ do
-            handleOneOpcode conn
-            pure "done main loop"
-        case eMainLoopError of
-          Left err -> do
-            fprint ("main loop error: " % sh % "\n") err
-            _ <- runExceptT $ do
-              sendMessage conn $ StdErrError 1 $ T.pack $ show err
-              sendMessage conn $ NixInt stderrLast
-            pure $ ExitFailure 1
-          Right success' -> do
-            fprint ("main loop finished without error: " % sh @T.Text % "\n") success'
-            _ <- runExceptT $ do
-              sendMessage conn $ NixInt stderrLast
-            pure ExitSuccess
+      Right res -> pure res
 
 --    handshake stdin stdout
 --    -- sendAll stdout $ Data.ByteString.Builder.toLazyByteString $ Data.ByteString.Builder.word64LE workerMagic2
@@ -339,9 +349,6 @@ writeString stdout text = do
 -- readInt :: Get Word64
 -- readInt = do
 --   runGet getWord64le rd
-stderrLast :: Word64
-stderrLast = 0x616C7473 -- stla
-
 hashSHA256 :: BS.ByteString -> BS.ByteString
 hashSHA256 bs = BA.convert (Hash.hash bs :: Hash.Digest Hash.SHA256)
 

@@ -3,10 +3,11 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module NixProtocol where
 
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (liftIO, MonadIO)
 import Control.Monad.Trans.Except (ExceptT)
 import Control.Monad.Trans.Except.Extra (left)
 import Control.Monad (replicateM)
@@ -29,9 +30,9 @@ import Control.Concurrent.STM.TMVar
 import Control.Monad.STM (atomically)
 --import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Text.Encoding as T
-import Network.SSH (InputStream, OutputStream, receive, sendAll)
+import Network.SSH (InputStream, OutputStream, receive, sendAll, receiveAll)
 import Formatting ((%), fprint, sformat)
-import Formatting.ShortFormatters (sh)
+import Formatting.ShortFormatters (sh, d)
 
 -- based on code from https://github.com/lpeterse/haskell-ssh
 newtype NixInt =
@@ -94,6 +95,7 @@ data WorkerOpcode
 
 intToOpcode :: Word64 -> WorkerOpcode
 intToOpcode 31 = WOPQueryValidPaths
+intToOpcode 44 = WOPAddMultipleToStore
 intToOpcode w = WOPUnhandled w
 
 instance Binary WorkerOpcode where
@@ -104,7 +106,9 @@ instance Binary WorkerOpcode where
 
 paddingSize :: Word64 -> Int
 paddingSize 0 = 0
-paddingSize n = fromIntegral $ 8 - (n `mod` 8)
+paddingSize n = fromIntegral $ if modded == 0 then 0 else 8 - modded
+  where
+    modded = n `mod` 8
 
 class MessageStream a where
   sendMessage ::
@@ -112,10 +116,8 @@ class MessageStream a where
     => a
     -> msg
     -> ExceptT Text IO ()
-  receiveMessage ::
-       forall msg. Binary msg
-    => a
-    -> ExceptT Text IO msg
+  receiveMessage :: forall msg. Binary msg => a -> ExceptT Text IO msg
+  receiveFramedMessage :: a -> ExceptT Text IO LBS.ByteString
 
 data (InputStream istream, OutputStream ostream) =>
      Connection istream ostream =
@@ -134,15 +136,55 @@ instance (InputStream istream, OutputStream ostream) =>
       loop :: Maybe ByteString -> Decoder msg -> ExceptT Text IO msg
       loop _ (Fail _unconsumed _offset _errmsg) = left "todo"
       loop (Just extra) (Partial fun) = do
-        liftIO $ fprint ("leftover from last read "%sh%"\n") extra
+        --liftIO $ fprint ("leftover from last read "%sh%"\n") extra
         loop Nothing $ fun $ Just extra
       loop Nothing (Partial fun) = do
         bs <- liftIO $ receive istream 4096
-        liftIO $ fprint ("did ssh read of " % sh % "\n") bs
+        --liftIO $ fprint ("did ssh read of " % sh % "\n") bs
         loop Nothing $ fun $ Just bs
       loop _ (Done remain _offset res) = do
         liftIO $ atomically $ putTMVar unconsumed remain
         pure res
+  receiveFramedMessage conn@Connection{istream, unconsumed} = do
+    NixInt frameSize <- receiveMessage conn
+    --liftIO $ fprint ("frame size: " % d % "\n") frameSize
+    loop mempty frameSize
+      where
+        take :: MonadIO m => Int -> m LBS.ByteString
+        take len = do
+          extra <- liftIO $ atomically $ takeTMVar unconsumed
+          if
+            | (BS.length extra == 0) -> do
+              --liftIO $ print "direct receiveAll"
+              liftIO $ do
+                atomically $ putTMVar unconsumed mempty
+                BS.fromStrict <$> receiveAll istream len
+            | (BS.length extra) < len -> do
+              liftIO $ atomically $ putTMVar unconsumed mempty
+              more <- take (len - (BS.length extra))
+              pure $ (BS.fromStrict extra) <> more
+            | (BS.length extra) == len -> do
+              --liftIO $ print "case2"
+              liftIO $ atomically $ putTMVar unconsumed mempty
+              pure $ BS.fromStrict extra
+            | (BS.length extra) > len -> do
+              --liftIO $ print "case3"
+              let (want, moreExtra) = BS.splitAt len extra
+              liftIO $ atomically $ putTMVar unconsumed moreExtra
+              pure $ BS.fromStrict want
+            | otherwise -> do
+              liftIO $ print "case4"
+              liftIO $ do
+                atomically $ putTMVar unconsumed mempty
+                BS.fromStrict <$> receiveAll istream len
+        loop :: LBS.ByteString -> Word64 -> ExceptT Text IO LBS.ByteString
+        loop xs 0 = pure $ xs
+        loop xs len = do
+          --liftIO $ fprint ("loop(" % d % "," % d % ")\n") (LBS.length xs) len
+          payload <- take $ fromIntegral len
+          NixInt frameSize <- receiveMessage conn
+          --liftIO $ fprint ("frame size: " % d % "\n") frameSize
+          loop (xs <> payload) frameSize
   sendMessage Connection {ostream} msg = liftIO $ do
     let lbs = runPut $ put msg
     mapM_ (sendAll ostream) $ LBS.toChunks lbs
@@ -160,7 +202,9 @@ instance Binary NixString where
     put $ NixByteString $ T.encodeUtf8 msg
 
 instance Binary a => Binary (NixList a) where
-  put = undefined
+  put (NixList list) = do
+    put $ length list
+    mapM_ put list
   get = do
     NixInt listLength <- get
     NixList <$> replicateM (fromIntegral listLength) get
@@ -215,12 +259,27 @@ handleOneOpcode conn = do
   liftIO $ do
     print @WorkerOpcode opcode
   case opcode of
-    WOPQueryValidPaths -> do
+    WOPQueryValidPaths -> do -- 31
       paths <- getStringList conn
-      liftIO $ print paths
+      NixInt buildersUseSubstitutes <- receiveMessage conn
+      liftIO $ fprint ("paths: " % sh % " use binary cache: " % sh % "\n" ) paths buildersUseSubstitutes
+      sendMessage conn $ NixInt stderrLast
+      sendMessage conn emptyPathList
       pure ()
+    WOPAddMultipleToStore -> do -- 44
+      NixInt repair <- receiveMessage conn
+      NixInt dontCheckSigs <- receiveMessage conn
+      liftIO $ fprint ("add multiple, repair: " % sh % " dontCheck: " % sh % "\n") repair dontCheckSigs
+      narstream <- receiveFramedMessage conn
+      let
+        ListOfNars nars = runGet get narstream
+      liftIO $ mapM_ (print . fst) nars
+      sendMessage conn $ NixInt stderrLast
     other -> do
       left $ sformat ("unhandled opcode: " % sh) other
+
+emptyPathList :: NixList NixString
+emptyPathList = NixList []
 
 data StdErrError =
   StdErrError
@@ -252,3 +311,46 @@ getStringList :: (InputStream stdin, OutputStream stdout) => Connection stdin st
 getStringList conn = do
   NixList l <- (receiveMessage conn :: ExceptT Text IO (NixList NixString))
   pure $ map (\(NixString str) -> str) l
+
+stderrLast :: Word64
+stderrLast = 0x616C7473 -- stla
+
+data ValidPathInfo = ValidPathInfo
+  { vpiOutPath :: Text
+  , vpiDeriver :: Text
+  , vpiNarHash :: Text
+  , vpiReferences :: [Text]
+  , vpiRegistrationTime :: Word64
+  , vpiNarSize :: Word64
+  , vpiUltimate :: Bool
+  , vpiSigs :: [Text]
+  , vpiContentAddress :: Text
+  } deriving Show
+
+instance Binary ValidPathInfo where
+  put = undefined
+  get = do
+    NixString outPath <- get
+    NixString drv <- get
+    NixString narHash <- get
+    NixList l <- get
+    let references = map (\(NixString str) -> str) l
+    NixInt regtime <- get
+    NixInt narSize <- get
+    NixInt ultimate <- get
+    NixList rawSigs <- get
+    let sigs = map (\(NixString str) -> str) rawSigs
+    NixString ca <- get
+    pure $ ValidPathInfo outPath drv narHash references regtime narSize (ultimate /= 0) sigs ca
+
+newtype ListOfNars = ListOfNars [(ValidPathInfo, ByteString)]
+
+instance Binary ListOfNars where
+  put = undefined
+  get = do
+    NixInt narCount <- get
+    l <- replicateM (fromIntegral narCount) $ do
+      vpi <- get
+      nar <- getByteString (fromIntegral $ vpiNarSize vpi)
+      pure (vpi,nar)
+    pure $ ListOfNars l
