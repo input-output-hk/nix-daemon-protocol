@@ -77,8 +77,10 @@ main
   print privateKey
 
   pubfilebytes <- BS.readFile "ssh-host-key.pub"
-  print pubfilebytes
-  decodePublicKey pubfilebytes >>= fprint ("raw parse result " % sh % "\n")
+  fprint ("raw pubkey file: " % sh % "\n") pubfilebytes
+  pubkey <- decodePublicKey pubfilebytes
+  fprint ("raw parse result " % sh % "\n") pubkey
+  fprint ("fingerprint: " % sh % "\n") $ pubkeyFingerprint pubkey
 
   bracket open close (accept config privateKey)
   where
@@ -118,14 +120,14 @@ main
                 print emsg
                 S.close stream
 
-decodePublicKey :: (MonadFail m, BA.ByteArray ba) => ba -> m (BS.ByteString, PublicKey)
+decodePublicKey :: (MonadFail m, BA.ByteArray ba) => ba -> m PublicKey
 decodePublicKey = f . BP.parse parsePubkey . BA.convert
   where
     f (BP.ParseOK _ a) = pure a
     f (BP.ParseFail e) = fail e
     f (BP.ParseMore c) = f (c Nothing)
 
-parsePubkey :: BP.Parser BS.ByteString (BS.ByteString, PublicKey)
+parsePubkey :: BP.Parser BS.ByteString PublicKey
 parsePubkey = do
   BP.bytes "ssh-ed25519"
   void $ many space
@@ -133,7 +135,7 @@ parsePubkey = do
   void $ many space
   _comment <- BP.takeAll
   case BP.parse parseRawPubKey bs of
-    BP.ParseOK rest key -> pure (rest, key)
+    BP.ParseOK _ key -> pure key
     BP.ParseFail e   -> fail e
     BP.ParseMore _   -> syntaxError
 
