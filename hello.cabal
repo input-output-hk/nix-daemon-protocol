@@ -37,23 +37,24 @@ executable hello
               , SocketDuplex
   ghc-options: -Wall
   build-depends: base
+               , Cabal
+               , async
+               , base64-bytestring
                , binary
                , bytestring
-               , Cabal
-               , hssh
-               , memory
-               , data-default
-               , async
                , cereal
                , containers
                , cryptonite
-               , stm
+               , data-default
+               , formatting
+               , ghc
+               , hssh
+               , memory
                , socket
+               , stm
+               , text
                , transformers
                , transformers-except
-               , text
-               , ghc
-               , formatting
 
   if flag(threaded)
      ghc-options: -threaded
