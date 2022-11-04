@@ -6,7 +6,11 @@
       base = ./.;
       packages = {hello = ./.;};
       ghcid.shellConfig = {
-        buildInputs = [config.pkgs.haskellPackages.hindent];
+        buildInputs = with config.pkgs; [
+          haskellPackages.hindent
+          treefmt
+          alejandra
+        ];
       };
     });
 }

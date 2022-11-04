@@ -17,19 +17,3 @@ options = [
 [formatter.haskell]
 includes = ["*.hs"]
 command = "hindent"
-
-[formatter.gleam]
-includes = ["*.gleam"]
-command = "gleam"
-options = ["format"]
-
-[formatter.erlang]
-includes = [ "*.erl", "*.hrl", "*.app", "*.app.src", "*.config", "*.script", "*.escript" ]
-excludes = ["build/", "_build/"]
-command = "erl-format"
-
-[formatter.elixir]
-includes = [ "*.ex", "*.exs" ]
-excludes = ["build/", "_build/", "deps/"]
-command = "mix"
-options = ["format"]

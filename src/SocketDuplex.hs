@@ -3,16 +3,12 @@
 
 module SocketDuplex where
 
-import Network.SSH
-  ( DuplexStream
-  , InputStream(..)
-  , OutputStream(..)
-  )
+import Control.Exception (handle, throwIO)
+import qualified Data.ByteArray as BA
+import Network.SSH (DuplexStream, InputStream(..), OutputStream(..))
 import qualified System.Socket as S
 import qualified System.Socket.Type.Stream as S
 import qualified System.Socket.Unsafe as S
-import qualified Data.ByteArray as BA
-import Control.Exception (handle, throwIO)
 
 -------------------------------------------------------------------------------
 -- Instances for use with the socket library

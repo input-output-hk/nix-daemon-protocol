@@ -7,10 +7,12 @@
 
 module NixProtocol where
 
-import Control.Monad.IO.Class (liftIO, MonadIO)
+import Control.Concurrent.STM.TMVar (TMVar, newTMVarIO, putTMVar, takeTMVar)
+import Control.Monad (replicateM)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.STM (atomically)
 import Control.Monad.Trans.Except (ExceptT)
 import Control.Monad.Trans.Except.Extra (left)
-import Control.Monad (replicateM)
 import Data.Binary
 import Data.Binary.Get
 import Data.Binary.Put
@@ -19,32 +21,26 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Text (Text)
-import GHC.Base (when)
-
-import Control.Concurrent.STM.TMVar
-  ( TMVar
-  , newTMVarIO
-  , putTMVar
-  , takeTMVar
-  )
-import Control.Monad.STM (atomically)
---import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Text.Encoding as T
-import Network.SSH (InputStream, OutputStream, receive, sendAll, receiveAll)
 import Formatting ((%), fprint, sformat)
-import Formatting.ShortFormatters (sh, d)
+import Formatting.ShortFormatters (sh)
+import GHC.Base (when)
+import Network.SSH (InputStream, OutputStream, receive, receiveAll, sendAll)
 
 -- based on code from https://github.com/lpeterse/haskell-ssh
 newtype NixInt =
   NixInt Word64
 
 newtype NixString =
-  NixString Text deriving Show
+  NixString Text
+  deriving (Show)
 
 newtype NixByteString =
   NixByteString ByteString
 
-newtype NixList a = NixList [a] deriving Show
+newtype NixList a =
+  NixList [a]
+  deriving (Show)
 
 data ClientVersion =
   ClientVersion
@@ -54,47 +50,62 @@ data ClientVersion =
   deriving (Show)
 
 data WorkerOpcode
-  = WOPIsValidPath
-  | WOPHasSubstitutes
-  | WOPQueryReferrers
-  | WOPAddToStore
-  | WOPAddTextToStore
-  | WOPBuildPaths
-  | WOPEnsurePath
-  | WOPAddTempRoot
-  | WOPAddIndirectRoot
-  | WOPSyncWithGC
-  | WOPFindRoots
-  | WOPSetOptions
-  | WOPCollectGarbage
-  | WOPQuerySubstitutablePathInfo
-  | WOPQueryAllValidPaths
-  | WOPQueryFailedPaths
-  | WOPClearFailedPaths
-  | WOPQueryPathInfo
-  | WOPQueryPathFromHashPart
-  | WOPQuerySubstitutablePathInfos
-  | WOPQueryValidPaths
-  | WOPQuerySubstitutablePaths
-  | WOPQueryValidDerivers
-  | WOPOptimiseStore
-  | WOPVerifyStore
-  | WOPBuildDerivation
-  | WOPAddSignatures
-  | WOPNarFromPath
-  | WOPAddToStoreNar
-  | WOPQueryMissing
-  | WOPQueryDerivationOutputMap
-  | WOPRegisterDrvOutput
-  | WOPQueryRealisation
-  | WOPAddMultipleToStore
-  | WOPAddBuildLog
-  | WOPBuildPathsWithResults
+  = WOPQuitObsolete -- 0
+  | WOPIsValidPath -- 1
+  | WOPQuerySubstitutesObsolete -- 2
+  | WOPQuerySubstitutes -- 3
+  | WOPQueryPathHashObsolete -- 4
+  | WOPQueryReferencesObsolete -- 5
+  | WOPQueryReferrers -- 6
+  | WOPAddToStore -- 7
+  | WOPAddTextToStore -- 8
+  | WOPBuildPaths -- 9
+  | WOPEnsurePath -- 10
+  | WOPAddTempRoot -- 11
+  | WOPAddIndirectRoot -- 12
+  | WOPSyncWithGC -- 13
+  | WOPFindRoots -- 14
+  | WOPCollectGarbageObsolete -- 15
+  | WOPExportPathObsolete -- 16
+  | WOPImportPathObsolete -- 17
+  | WOPQueryDeriverObsolete -- 18
+  | WOPSetOptions -- 19
+  | WOPCollectGarbage -- 20
+  | WOPQuerySubstitutablePathInfo -- 21
+  | WOPQueryDerivationOutputsObsolete -- 22
+  | WOPQueryAllValidPaths -- 23
+  | WOPQueryFailedPaths -- 24
+  | WOPClearFailedPaths -- 25
+  | WOPQueryPathInfo -- 26
+  | WOPImportPathsObsolete -- 27
+  | WOPQueryDerivationOutputNamesObsolete -- 28
+  | WOPQueryPathFromHashPart -- 29
+  | WOPQuerySubstitutablePathInfos -- 30
+  | WOPQueryValidPaths -- 31
+  | WOPQuerySubstitutablePaths -- 32
+  | WOPQueryValidDerivers -- 33
+  | WOPOptimiseStore -- 34
+  | WOPVerifyStore -- 35
+  | WOPBuildDerivation -- 36
+  | WOPAddSignatures -- 37
+  | WOPNarFromPath -- 38
+  | WOPAddToStoreNar -- 39
+  | WOPQueryMissing -- 40
+  | WOPQueryDerivationOutputMap -- 41
+  | WOPRegisterDrvOutput -- 42
+  | WOPQueryRealisation -- 43
+  | WOPAddMultipleToStore -- 44
+  | WOPAddBuildLog -- 45
+  | WOPBuildPathsWithResults -- 46
   | WOPUnhandled Word64
-  deriving Show
+  deriving (Show)
 
 intToOpcode :: Word64 -> WorkerOpcode
+intToOpcode 1 = WOPIsValidPath
+intToOpcode 11 = WOPAddTempRoot
+intToOpcode 26 = WOPQueryPathInfo
 intToOpcode 31 = WOPQueryValidPaths
+intToOpcode 42 = WOPRegisterDrvOutput
 intToOpcode 44 = WOPAddMultipleToStore
 intToOpcode w = WOPUnhandled w
 
@@ -106,7 +117,11 @@ instance Binary WorkerOpcode where
 
 paddingSize :: Word64 -> Int
 paddingSize 0 = 0
-paddingSize n = fromIntegral $ if modded == 0 then 0 else 8 - modded
+paddingSize n =
+  fromIntegral $
+  if modded == 0
+    then 0
+    else 8 - modded
   where
     modded = n `mod` 8
 
@@ -116,7 +131,10 @@ class MessageStream a where
     => a
     -> msg
     -> ExceptT Text IO ()
-  receiveMessage :: forall msg. Binary msg => a -> ExceptT Text IO msg
+  receiveMessage ::
+       forall msg. Binary msg
+    => a
+    -> ExceptT Text IO msg
   receiveFramedMessage :: a -> ExceptT Text IO LBS.ByteString
 
 data (InputStream istream, OutputStream ostream) =>
@@ -135,8 +153,9 @@ instance (InputStream istream, OutputStream ostream) =>
     where
       loop :: Maybe ByteString -> Decoder msg -> ExceptT Text IO msg
       loop _ (Fail _unconsumed _offset _errmsg) = left "todo"
-      loop (Just extra) (Partial fun) = do
+      loop (Just extra) (Partial fun)
         --liftIO $ fprint ("leftover from last read "%sh%"\n") extra
+       = do
         loop Nothing $ fun $ Just extra
       loop Nothing (Partial fun) = do
         bs <- liftIO $ receive istream 4096
@@ -145,50 +164,54 @@ instance (InputStream istream, OutputStream ostream) =>
       loop _ (Done remain _offset res) = do
         liftIO $ atomically $ putTMVar unconsumed remain
         pure res
-  receiveFramedMessage conn@Connection{istream, unconsumed} = do
+  receiveFramedMessage conn@Connection {istream, unconsumed} = do
     NixInt frameSize <- receiveMessage conn
     --liftIO $ fprint ("frame size: " % d % "\n") frameSize
     loop mempty frameSize
-      where
-        take :: MonadIO m => Int -> m LBS.ByteString
-        take len = do
-          extra <- liftIO $ atomically $ takeTMVar unconsumed
-          if
-            | (BS.length extra == 0) -> do
+    where
+      takePayload :: MonadIO m => Int -> m LBS.ByteString
+      takePayload len = do
+        extra <- liftIO $ atomically $ takeTMVar unconsumed
+        if | (BS.length extra == 0)
               --liftIO $ print "direct receiveAll"
-              liftIO $ do
-                atomically $ putTMVar unconsumed mempty
-                BS.fromStrict <$> receiveAll istream len
-            | (BS.length extra) < len -> do
-              liftIO $ atomically $ putTMVar unconsumed mempty
-              more <- take (len - (BS.length extra))
-              pure $ (BS.fromStrict extra) <> more
-            | (BS.length extra) == len -> do
+            ->
+             do liftIO $ do
+                  atomically $ putTMVar unconsumed mempty
+                  BS.fromStrict <$> receiveAll istream len
+           | (BS.length extra) < len ->
+             do liftIO $ atomically $ putTMVar unconsumed mempty
+                more <- takePayload (len - (BS.length extra))
+                pure $ (BS.fromStrict extra) <> more
+           | (BS.length extra) == len
               --liftIO $ print "case2"
-              liftIO $ atomically $ putTMVar unconsumed mempty
-              pure $ BS.fromStrict extra
-            | (BS.length extra) > len -> do
+            ->
+             do liftIO $ atomically $ putTMVar unconsumed mempty
+                pure $ BS.fromStrict extra
+           | (BS.length extra) > len
               --liftIO $ print "case3"
-              let (want, moreExtra) = BS.splitAt len extra
-              liftIO $ atomically $ putTMVar unconsumed moreExtra
-              pure $ BS.fromStrict want
-            | otherwise -> do
-              liftIO $ print "case4"
-              liftIO $ do
-                atomically $ putTMVar unconsumed mempty
-                BS.fromStrict <$> receiveAll istream len
-        loop :: LBS.ByteString -> Word64 -> ExceptT Text IO LBS.ByteString
-        loop xs 0 = pure $ xs
-        loop xs len = do
+            ->
+             do let (want, moreExtra) = BS.splitAt len extra
+                liftIO $ atomically $ putTMVar unconsumed moreExtra
+                pure $ BS.fromStrict want
+           | otherwise ->
+             do liftIO $ print @Text "case4"
+                liftIO $ do
+                  atomically $ putTMVar unconsumed mempty
+                  BS.fromStrict <$> receiveAll istream len
+      loop :: LBS.ByteString -> Word64 -> ExceptT Text IO LBS.ByteString
+      loop xs 0 = pure $ xs
+      loop xs len
           --liftIO $ fprint ("loop(" % d % "," % d % ")\n") (LBS.length xs) len
-          payload <- take $ fromIntegral len
-          NixInt frameSize <- receiveMessage conn
+       = do
+        payload <- takePayload $ fromIntegral len
+        NixInt frameSize <- receiveMessage conn
           --liftIO $ fprint ("frame size: " % d % "\n") frameSize
-          loop (xs <> payload) frameSize
-  sendMessage Connection {ostream} msg = liftIO $ do
-    let lbs = runPut $ put msg
-    mapM_ (sendAll ostream) $ LBS.toChunks lbs
-    pure ()
+        loop (xs <> payload) frameSize
+  sendMessage Connection {ostream} msg =
+    liftIO $ do
+      let lbs = runPut $ put msg
+      mapM_ (sendAll ostream) $ LBS.toChunks lbs
+      pure ()
 
 instance Binary NixInt where
   put (NixInt word) = putWord64le word
@@ -231,7 +254,7 @@ stderrError :: Word64
 stderrError = 0x63787470 -- ptxc
 
 protocolVersion :: Word64
-protocolVersion = 1 `shiftL` 8 .|. 34 -- 290
+protocolVersion = 1 `shiftL` 8 .|. 34
 
 handshake :: MessageStream s => s -> ExceptT Text IO ClientVersion
 handshake stream = do
@@ -245,8 +268,9 @@ handshake stream = do
       cv = ClientVersion major minor
   NixInt hasAffinity <- receiveMessage stream
   when (hasAffinity /= 0) $ do
-      NixInt _pinnedCpu <- receiveMessage stream
-      pure ()
+    NixInt _pinnedCpu <- receiveMessage stream
+    pure ()
+  when (minor >= 33) $ do sendMessage stream $ NixByteString "2.11.1"
   NixInt _unk <- receiveMessage stream
   pure cv
 
@@ -256,27 +280,89 @@ handleOneOpcode ::
   -> ExceptT Text IO ()
 handleOneOpcode conn = do
   opcode <- receiveMessage conn
-  liftIO $ do
-    print @WorkerOpcode opcode
+  liftIO $ do print @WorkerOpcode opcode
   case opcode of
-    WOPQueryValidPaths -> do -- 31
-      paths <- getStringList conn
-      NixInt buildersUseSubstitutes <- receiveMessage conn
-      liftIO $ fprint ("paths: " % sh % " use binary cache: " % sh % "\n" ) paths buildersUseSubstitutes
-      sendMessage conn $ NixInt stderrLast
-      sendMessage conn emptyPathList
-      pure ()
-    WOPAddMultipleToStore -> do -- 44
-      NixInt repair <- receiveMessage conn
-      NixInt dontCheckSigs <- receiveMessage conn
-      liftIO $ fprint ("add multiple, repair: " % sh % " dontCheck: " % sh % "\n") repair dontCheckSigs
-      narstream <- receiveFramedMessage conn
-      let
-        ListOfNars nars = runGet get narstream
-      liftIO $ mapM_ (print . fst) nars
-      sendMessage conn $ NixInt stderrLast
+    WOPAddTempRoot -> addTempRoot conn
+    WOPQueryValidPaths -> queryValidPaths conn
+    WOPAddMultipleToStore -> addMultipleToStore conn
+    WOPRegisterDrvOutput -> registerDrvOutput conn
+    WOPIsValidPath -> isValidPath conn
+    WOPQueryPathInfo -> queryPathInfo conn
     other -> do
       left $ sformat ("unhandled opcode: " % sh) other
+
+queryPathInfo ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO ()
+queryPathInfo conn = do
+  NixByteString storePath <- receiveMessage conn
+  liftIO $ fprint ("queryPathInfo storePath: " % sh % "\n") storePath
+  sendMessage conn $ NixInt stderrLast
+  -- TODO ValidPathInfo::write
+  sendMessage conn $ NixInt 0
+
+isValidPath ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO ()
+isValidPath conn = do
+  NixByteString storePath <- receiveMessage conn
+  liftIO $ fprint ("isValidPath storePath: " % sh % "\n") storePath
+  sendMessage conn $ NixInt stderrLast
+  sendMessage conn $ NixInt 1
+
+addTempRoot ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO ()
+addTempRoot conn = do
+  NixByteString storePath <- receiveMessage conn
+  liftIO $ fprint ("addTempRoot storePath: " % sh % "\n") storePath
+  sendMessage conn $ NixInt stderrLast
+  sendMessage conn $ NixInt 1
+
+queryValidPaths ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO ()
+queryValidPaths conn = do
+  paths <- getStringList conn
+  NixInt buildersUseSubstitutes <- receiveMessage conn
+  liftIO $
+    fprint
+      ("paths: " % sh % " use binary cache: " % sh % "\n")
+      paths
+      buildersUseSubstitutes
+  sendMessage conn $ NixInt stderrLast
+  sendMessage conn emptyPathList
+  sendMessage conn $ NixInt stderrLast
+
+addMultipleToStore ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO ()
+addMultipleToStore conn = do
+  NixInt repair <- receiveMessage conn
+  NixInt dontCheckSigs <- receiveMessage conn
+  liftIO $
+    fprint
+      ("add multiple, repair: " % sh % " dontCheck: " % sh % "\n")
+      repair
+      dontCheckSigs
+  narstream <- receiveFramedMessage conn
+  let ListOfNars nars = runGet get narstream
+  liftIO $ mapM_ (print . fst) nars
+  sendMessage conn $ NixInt stderrLast
+
+registerDrvOutput ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO ()
+registerDrvOutput conn = do
+  NixByteString realisation <- receiveMessage conn
+  liftIO $ fprint ("realisation:" % sh % "\n") realisation
+  sendMessage conn $ NixInt stderrLast
 
 emptyPathList :: NixList NixString
 emptyPathList = NixList []
@@ -307,7 +393,10 @@ newConnection stdin stdout = do
   leftover <- newTMVarIO mempty
   pure $ Connection {istream = stdin, ostream = stdout, unconsumed = leftover}
 
-getStringList :: (InputStream stdin, OutputStream stdout) => Connection stdin stdout -> ExceptT Text IO [Text]
+getStringList ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO [Text]
 getStringList conn = do
   NixList l <- (receiveMessage conn :: ExceptT Text IO (NixList NixString))
   pure $ map (\(NixString str) -> str) l
@@ -315,17 +404,19 @@ getStringList conn = do
 stderrLast :: Word64
 stderrLast = 0x616C7473 -- stla
 
-data ValidPathInfo = ValidPathInfo
-  { vpiOutPath :: Text
-  , vpiDeriver :: Text
-  , vpiNarHash :: Text
-  , vpiReferences :: [Text]
-  , vpiRegistrationTime :: Word64
-  , vpiNarSize :: Word64
-  , vpiUltimate :: Bool
-  , vpiSigs :: [Text]
-  , vpiContentAddress :: Text
-  } deriving Show
+data ValidPathInfo =
+  ValidPathInfo
+    { vpiOutPath :: Text
+    , vpiDeriver :: Text
+    , vpiNarHash :: Text
+    , vpiReferences :: [Text]
+    , vpiRegistrationTime :: Word64
+    , vpiNarSize :: Word64
+    , vpiUltimate :: Bool
+    , vpiSigs :: [Text]
+    , vpiContentAddress :: Text
+    }
+  deriving (Show)
 
 instance Binary ValidPathInfo where
   put = undefined
@@ -341,16 +432,28 @@ instance Binary ValidPathInfo where
     NixList rawSigs <- get
     let sigs = map (\(NixString str) -> str) rawSigs
     NixString ca <- get
-    pure $ ValidPathInfo outPath drv narHash references regtime narSize (ultimate /= 0) sigs ca
+    pure $
+      ValidPathInfo
+        outPath
+        drv
+        narHash
+        references
+        regtime
+        narSize
+        (ultimate /= 0)
+        sigs
+        ca
 
-newtype ListOfNars = ListOfNars [(ValidPathInfo, ByteString)]
+newtype ListOfNars =
+  ListOfNars [(ValidPathInfo, ByteString)]
 
 instance Binary ListOfNars where
   put = undefined
   get = do
     NixInt narCount <- get
-    l <- replicateM (fromIntegral narCount) $ do
-      vpi <- get
-      nar <- getByteString (fromIntegral $ vpiNarSize vpi)
-      pure (vpi,nar)
+    l <-
+      replicateM (fromIntegral narCount) $ do
+        vpi <- get
+        nar <- getByteString (fromIntegral $ vpiNarSize vpi)
+        pure (vpi, nar)
     pure $ ListOfNars l
