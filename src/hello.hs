@@ -260,6 +260,9 @@ handleSessionRequest _idnt _req =
                 _ <- forever $ handleOneOpcode conn
                 pure "done main loop"
             case eMainLoopError of
+              Left "eof" -> do
+                fprint ("main loop finished without error\n")
+                pure ExitSuccess
               Left err -> do
                 fprint ("main loop error: " % sh % "\n") err
                 _ <-

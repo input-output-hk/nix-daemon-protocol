@@ -107,6 +107,7 @@ intToOpcode 26 = WOPQueryPathInfo
 intToOpcode 31 = WOPQueryValidPaths
 intToOpcode 42 = WOPRegisterDrvOutput
 intToOpcode 44 = WOPAddMultipleToStore
+intToOpcode 45 = WOPAddBuildLog
 intToOpcode w = WOPUnhandled w
 
 instance Binary WorkerOpcode where
@@ -160,7 +161,9 @@ instance (InputStream istream, OutputStream ostream) =>
       loop Nothing (Partial fun) = do
         bs <- liftIO $ receive istream 4096
         --liftIO $ fprint ("did ssh read of " % sh % "\n") bs
-        loop Nothing $ fun $ Just bs
+        case bs of
+          "" -> left "eof"
+          _ -> loop Nothing $ fun $ Just bs
       loop _ (Done remain _offset res) = do
         liftIO $ atomically $ putTMVar unconsumed remain
         pure res
@@ -288,8 +291,24 @@ handleOneOpcode conn = do
     WOPRegisterDrvOutput -> registerDrvOutput conn
     WOPIsValidPath -> isValidPath conn
     WOPQueryPathInfo -> queryPathInfo conn
+    WOPAddBuildLog -> addBuildLog conn
     other -> do
       left $ sformat ("unhandled opcode: " % sh) other
+
+addBuildLog ::
+     (InputStream stdin, OutputStream stdout)
+  => Connection stdin stdout
+  -> ExceptT Text IO ()
+addBuildLog conn = do
+  NixByteString storePath <- receiveMessage conn
+  buildLog <- receiveFramedMessage conn
+  liftIO $
+    fprint
+      ("addBuildLog storePath: " % sh % " log: " % sh % "\n")
+      storePath
+      buildLog
+  sendMessage conn $ NixInt stderrLast
+  sendMessage conn $ NixInt 1
 
 queryPathInfo ::
      (InputStream stdin, OutputStream stdout)
@@ -418,10 +437,42 @@ data ValidPathInfo =
     }
   deriving (Show)
 
-instance Binary ValidPathInfo where
-  put = undefined
+newtype ValidPathInfoWithPath =
+  ValidPathInfoWithPath
+    { unVpiWithPath :: ValidPathInfo
+    }
+  deriving (Show)
+
+instance Binary ValidPathInfoWithPath where
+  put (ValidPathInfoWithPath (vpi@ValidPathInfo {vpiOutPath})) = do
+    put vpiOutPath
+    put vpi
   get = do
     NixString outPath <- get
+    vpi <- get
+    pure $ ValidPathInfoWithPath $ vpi {vpiOutPath = outPath}
+
+instance Binary ValidPathInfo where
+  put ValidPathInfo { vpiDeriver
+                    , vpiNarHash
+                    , vpiReferences
+                    , vpiRegistrationTime
+                    , vpiUltimate
+                    , vpiSigs
+                    , vpiContentAddress
+                    } = do
+    put $ NixString vpiDeriver
+    put $ NixString vpiNarHash
+    put $ NixList $ map NixString vpiReferences
+    put $ NixInt vpiRegistrationTime
+    put $
+      NixInt $
+      if vpiUltimate
+        then 1
+        else 0
+    put $ NixList $ map NixString vpiSigs
+    put $ NixString vpiContentAddress
+  get = do
     NixString drv <- get
     NixString narHash <- get
     NixList l <- get
@@ -434,7 +485,7 @@ instance Binary ValidPathInfo where
     NixString ca <- get
     pure $
       ValidPathInfo
-        outPath
+        ""
         drv
         narHash
         references
@@ -445,7 +496,7 @@ instance Binary ValidPathInfo where
         ca
 
 newtype ListOfNars =
-  ListOfNars [(ValidPathInfo, ByteString)]
+  ListOfNars [(ValidPathInfoWithPath, ByteString)]
 
 instance Binary ListOfNars where
   put = undefined
@@ -454,6 +505,6 @@ instance Binary ListOfNars where
     l <-
       replicateM (fromIntegral narCount) $ do
         vpi <- get
-        nar <- getByteString (fromIntegral $ vpiNarSize vpi)
+        nar <- getByteString (fromIntegral $ vpiNarSize $ unVpiWithPath vpi)
         pure (vpi, nar)
     pure $ ListOfNars l
