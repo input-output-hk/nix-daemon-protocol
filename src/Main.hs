@@ -6,24 +6,20 @@
 module Main where
 
 import Control.Applicative ((<|>), many)
-import Control.Concurrent (forkFinally)
-import Control.Exception (SomeException, bracket, bracketOnError, try)
+import Control.Exception (SomeException, try)
 import Control.Monad (forever, void)
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.Trans.Except (ExceptT)
 import Control.Monad.Trans.Except (runExceptT)
 import Control.Monad.Trans.Except.Extra (left)
 import Crypto.Error (CryptoFailable(CryptoFailed, CryptoPassed))
-import qualified Crypto.Hash as Hash
 import qualified Crypto.Hash.Algorithms ()
 import qualified Crypto.PubKey.Ed25519 as Ed25519
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import qualified Data.ByteArray as BA
 import qualified Data.ByteArray.Parse as BP
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as BSC
-import Data.Default (Default(def))
 import Data.Serialize (putByteString, runGet)
 import Data.Serialize.Get (getWord64le)
 import Data.Serialize.Put (runPut)
@@ -36,91 +32,58 @@ import Formatting.ShortFormatters (sh)
 import GHC.Base (when)
 import Network.SSH
   ( InputStream(..)
-  , KeyPair
   , OutputStream(..)
   , PublicKey(..)
-  , ServiceName
-  , UserName
-  , decodePrivateKeyFile
   , sendAll
   )
 import qualified Network.SSH.Server as Server
 import NixProtocol
-  ( NixInt(..)
-  , StdErrError(..)
+  ( StdErrError(..)
   , handleOneOpcode
   , newConnection
-  , sendMessage
   , stderrLast
   )
 import qualified NixProtocol
 import SocketDuplex ()
-import System.Exit (ExitCode(ExitFailure, ExitSuccess))
-import qualified System.Socket as S
-import qualified System.Socket.Family.Inet6 as S
-import qualified System.Socket.Protocol.Default as S
-import qualified System.Socket.Type.Stream as S
+import System.Exit (ExitCode(ExitFailure, ExitSuccess), exitWith)
+import HsshOld
+import Utils
+import Types (sendMessage, newHandleConnection, NixInt(..))
+import GHC.Stack (HasCallStack)
+import Options.Applicative
+import GHC.IO.Handle (hDuplicate, hDuplicateTo)
+import System.IO (stdin,stdout,stderr, hFlush, hSetBuffering, BufferMode(LineBuffering))
 
-data Ident =
-  JustUsername UserName
+data StartMode = StartModeSSH | StartModeStdio
+
+modeParser :: Parser StartMode
+modeParser = sshModeParser <|> stdioModeParser
+
+sshModeParser = flag' StartModeSSH (long "ssh")
+
+stdioModeParser = flag' StartModeStdio (long "stdio")
 
 main :: IO ()
 main = do
-  file <- BS.readFile "ssh-host-key"
-  -- ssh-keygen -t ed25519 -f ssh-host-key -N ''
-  (privateKey, _):_ <-
-    decodePrivateKeyFile BS.empty file :: IO [(KeyPair, BA.Bytes)]
-  print privateKey
-  pubfilebytes <- BS.readFile "ssh-host-key.pub"
-  fprint ("raw pubkey file: " % sh % "\n") pubfilebytes
-  pubkey <- decodePublicKey pubfilebytes
-  fprint ("raw parse result " % sh % "\n") pubkey
-  fprint ("fingerprint: " % sh % "\n") $ pubkeyFingerprint pubkey
-  bracket open close (accept config privateKey)
-  where
-    onAuthRequest :: UserName -> ServiceName -> PublicKey -> IO (Maybe Ident)
-    onAuthRequest username service key = do
-      fprint
-        ("auth request for user " % sh % " service " % sh %
-         " with pubkey fingerprint " %
-         sh %
-         "\n")
-        username
-        service $
-        pubkeyFingerprint key
-      pure (Just $ JustUsername username)
-    config =
-      Server.Config
-        { Server.transportConfig = Data.Default.def
-        , Server.userAuthConfig =
-            Data.Default.def {Server.onAuthRequest = onAuthRequest}
-        , Server.connectionConfig =
-            Data.Default.def
-              { Server.onSessionRequest = handleSessionRequest
-              , Server.onDirectTcpIpRequest = handleDirectTcpIpRequest
-              , Server.channelMaxQueueSize = 64 * 1024
-              }
-        }
-    open = S.socket :: IO (S.Socket S.Inet6 S.Stream S.Default)
-    close = S.close
-    accept ::
-         Server.Config identity
-      -> KeyPair
-      -> S.Socket S.Inet6 S.Stream S.Default
-      -> IO b
-    accept cfg agent s = do
-      print @T.Text "running"
-      S.setSocketOption s (S.ReuseAddress True)
-      S.setSocketOption s (S.V6Only False)
-      S.bind s (S.SocketAddressInet6 S.inet6Any 2222 0 0)
-      S.listen s 5
-      forever $
-        bracketOnError (S.accept s) (S.close . fst) $ \(stream, peer) -> do
-          putStrLn $ "Connection from " ++ show peer
-          void $
-            forkFinally (Server.serve cfg agent stream >>= print) $ \emsg -> do
-              print emsg
-              S.close stream
+  let
+    opts = info (modeParser <**> helper) (fullDesc)
+  mode <- execParser opts
+  when False $ do
+    pubfilebytes <- BS.readFile "ssh-host-key.pub"
+    fprint ("raw pubkey file: " % sh % "\n") pubfilebytes
+    pubkey <- decodePublicKey pubfilebytes
+    fprint ("raw parse result " % sh % "\n") pubkey
+    fprint ("fingerprint: " % sh % "\n") $ pubkeyFingerprint pubkey
+  case mode of
+    StartModeSSH -> HsshOld.startSshServer sessionHandler
+    StartModeStdio -> do
+      protocolOut <- hDuplicate stdout
+      hSetBuffering stderr LineBuffering
+      hDuplicateTo stderr stdout
+      hSetBuffering stdout LineBuffering
+      code <- sessionHandler stdin protocolOut stderr
+      hFlush stderr
+      exitWith code
 
 decodePublicKey :: (MonadFail m, BA.ByteArray ba) => ba -> m PublicKey
 decodePublicKey = f . BP.parse parsePubkey . BA.convert
@@ -218,21 +181,6 @@ parsePubkey = do
         padding :: (BA.ByteArray ba) => BP.Parser ba ()
         padding = BP.byte 61 -- 61 == fromEnum '='
 
--- for when the user tries to do tcp forwarding over ssh
-handleDirectTcpIpRequest ::
-     Ident -> Server.DirectTcpIpRequest -> IO (Maybe Server.DirectTcpIpHandler)
-handleDirectTcpIpRequest _idnt req =
-  pure $
-  Just $
-  Server.DirectTcpIpHandler $ \stream -> do
-    bs <- receive stream 4096
-    sendAll stream "HTTP/1.1 200 OK\n"
-    sendAll stream "Content-Type: text/plain\n\n"
-    sendAll stream $! BS.pack $ fmap (fromIntegral . fromEnum) $ show req
-    sendAll stream "\n\n"
-    sendAll stream bs
-    print bs
-
 handleSessionRequest ::
      Ident -> Server.SessionRequest -> IO (Maybe Server.SessionHandler)
 handleSessionRequest _idnt _req =
@@ -283,6 +231,49 @@ handleSessionRequest _idnt _req =
         pure $ ExitFailure 1
       Right res -> pure res
 
+sessionHandler :: HasCallStack => SessionHandler
+sessionHandler stdin stdout stderr = do
+  eFinalResult <- try $ do
+    conn <- newHandleConnection stdin stdout
+    eResult <- runExceptT $ do
+      clientVersion <- NixProtocol.handshake conn
+      sendMessage conn $ NixInt stderrLast
+      liftIO $ do fprint ("client with " % sh % " connected\n") clientVersion
+      pure "handshake done"
+    case eResult of
+      Left err -> do
+        print err
+        pure $ ExitFailure 1
+      Right success -> do
+        print @T.Text success
+        eMainLoopError <-
+          runExceptT $ do
+            _ <- forever $ handleOneOpcode conn
+            pure "done main loop"
+        case eMainLoopError of
+          Left "eof" -> do
+            fprint ("main loop finished without error\n")
+            pure ExitSuccess
+          Left err -> do
+            fprint ("main loop error: " % sh % "\n") err
+            _ <-
+              runExceptT $ do
+                sendMessage conn $ StdErrError 1 $ T.pack $ show err
+                sendMessage conn $ NixInt stderrLast
+            pure $ ExitFailure 1
+          Right success' -> do
+            fprint
+              ("main loop finished without error: " % sh @T.Text % "\n")
+              success'
+            _ <- runExceptT $ do sendMessage conn $ NixInt stderrLast
+            pure ExitSuccess
+  case eFinalResult of
+    Left err -> do
+      print @SomeException err
+      BS.hPut stderr $ BSC.pack $ show err
+      pure $ ExitFailure 1
+    Right res -> pure res
+
 data ErrorType
   = ErrorTypeParsingWord String
   | ErrorTypeParsingSomethingElse String
@@ -327,15 +318,4 @@ writeString stdout text = do
           putByteString $ BS.pack padding
   liftIO $ sendAll stdout encodedBytes
 
-hashSHA256 :: BS.ByteString -> BS.ByteString
-hashSHA256 bs = BA.convert (Hash.hash bs :: Hash.Digest Hash.SHA256)
 
-pubkeyFingerprint :: PublicKey -> T.Text
-pubkeyFingerprint pubkey =
-  maybe "unsupported algo" (T.decodeLatin1 . Base64.encode . hashSHA256) $
-  keyToRawBytes pubkey
-  where
-    keyToRawBytes :: PublicKey -> Maybe BS.ByteString
-    keyToRawBytes (PublicKeyEd25519 key') =
-      Just $ "\NUL\NUL\NUL\vssh-ed25519\NUL\NUL\NUL " <> (BA.convert key')
-    keyToRawBytes _ = Nothing

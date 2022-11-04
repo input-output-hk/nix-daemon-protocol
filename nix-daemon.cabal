@@ -2,7 +2,7 @@
 -- documentation, which can be found here:
 --   http://haskell.org/cabal/release/cabal-latest/doc/users-guide/
 
-name: hello
+name: nix-daemon
 version: 1.0.0.2
 license: BSD3
 license-file: LICENSE
@@ -30,11 +30,15 @@ source-repository head
 flag threaded
   default: False
 
-executable hello
+flag hssh-old
+  default: True
+
+executable nix-daemon
   hs-source-dirs: src
-  main-is: hello.hs
+  main-is: Main.hs
   other-modules: NixProtocol
-              , SocketDuplex
+               , Types
+               , Utils
   ghc-options: -Wall
   build-depends: base
                , Cabal
@@ -48,8 +52,9 @@ executable hello
                , data-default
                , formatting
                , ghc
-               , hssh
                , memory
+               , optparse-applicative
+               , process
                , socket
                , stm
                , text
@@ -58,3 +63,8 @@ executable hello
 
   if flag(threaded)
      ghc-options: -threaded
+
+  if flag(hssh-old)
+    other-modules: SocketDuplex
+                 , HsshOld
+    build-depends: hssh
