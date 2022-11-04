@@ -21,6 +21,8 @@ import System.IO (Handle, hFlush)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Text.Encoding as T
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 
 paddingSize :: Word64 -> Int
 paddingSize 0 = 0
@@ -32,7 +34,7 @@ paddingSize n =
   where
     modded = n `mod` 8
 
-newtype NixInt = NixInt Word64
+newtype NixInt = NixInt Word64 deriving Show
 
 instance Binary NixInt where
   put (NixInt word) = putWord64le word
@@ -49,8 +51,7 @@ instance Binary NixString where
   put (NixString msg) = do
     put $ NixByteString $ T.encodeUtf8 msg
 
-newtype NixByteString =
-  NixByteString ByteString
+newtype NixByteString = NixByteString ByteString deriving Show
 
 instance Binary NixByteString where
   get = do
@@ -79,7 +80,7 @@ instance Binary a => Binary (NixList a) where
 -- based on code from https://github.com/lpeterse/haskell-ssh
 class MessageStream a where
   sendMessage ::
-       forall msg. Binary msg
+       forall msg. (Binary msg, Show msg)
     => a
     -> msg
     -> ExceptT Text IO ()
@@ -164,3 +165,37 @@ newHandleConnection :: Handle -> Handle -> IO HandleConnection
 newHandleConnection stdin stdout = do
   leftover <- newTMVarIO mempty
   pure $ HandleConnection stdin stdout leftover
+
+data DerivationToBuild = DerivationToBuild
+  { dtbDrvPath :: Text
+  , dtbOutputs :: [(Text, Text, Text, Text)]
+  , dtbInputs :: [Text]
+  , dtbSystem :: Text
+  , dtbBuilder :: Text
+  , dtbArgs :: [Text]
+  , dtbEnv :: Map Text Text
+  } deriving Show
+
+instance Binary DerivationToBuild where
+  put = undefined
+  get = do
+    NixString drvPath <- get
+    NixInt outputCount <- get
+    outputs <- replicateM (fromIntegral outputCount) $ do
+      NixString outputName <- get
+      NixString a <- get
+      NixString b <- get
+      NixString c <- get
+      pure (outputName,a,b,c)
+    NixList l <- get
+    let inputs = map (\(NixString str) -> str) l
+    NixString system <- get
+    NixString builder <- get
+    NixList l2 <- get
+    let args = map (\(NixString str) -> str) l2
+    NixInt envCount <- get
+    envList <- replicateM (fromIntegral envCount) $ do
+      NixString k <- get
+      NixString v <- get
+      pure (k,v)
+    pure $ DerivationToBuild drvPath outputs inputs system builder args (Map.fromList envList)

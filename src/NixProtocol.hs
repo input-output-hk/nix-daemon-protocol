@@ -91,6 +91,7 @@ intToOpcode 1 = WOPIsValidPath
 intToOpcode 11 = WOPAddTempRoot
 intToOpcode 26 = WOPQueryPathInfo
 intToOpcode 31 = WOPQueryValidPaths
+intToOpcode 36 = WOPBuildDerivation
 intToOpcode 42 = WOPRegisterDrvOutput
 intToOpcode 44 = WOPAddMultipleToStore
 intToOpcode 45 = WOPAddBuildLog
@@ -231,6 +232,7 @@ handleOneOpcode conn = do
     WOPIsValidPath -> isValidPath conn
     WOPQueryPathInfo -> queryPathInfo conn
     WOPAddBuildLog -> addBuildLog conn
+    WOPBuildDerivation -> buildDerivation conn
     other -> do
       left $ sformat ("unhandled opcode: " % sh) other
 
@@ -323,6 +325,14 @@ registerDrvOutput conn = do
   liftIO $ fprint ("realisation:" % sh % "\n") realisation
   sendMessage conn $ NixInt stderrLast
 
+buildDerivation :: (HasCallStack ,MessageStream conn) => conn -> ExceptT Text IO ()
+buildDerivation conn = do
+  drv <- receiveMessage conn :: ExceptT Text IO DerivationToBuild
+  prt drv
+
+  undefined
+  pure ()
+
 emptyPathList :: NixList NixString
 emptyPathList = NixList []
 
@@ -330,7 +340,7 @@ data StdErrError =
   StdErrError
     { verbosity :: Int
     , msg :: Text
-    }
+    } deriving Show
 
 instance Binary StdErrError where
   get = undefined
