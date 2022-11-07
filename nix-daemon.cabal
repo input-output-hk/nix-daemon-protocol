@@ -4,14 +4,16 @@
 
 name: nix-daemon
 version: 1.0.0.2
-license: BSD3
+license: Apache-2.0
 license-file: LICENSE
-copyright: (c) Simon Marlow
-author: Simon Marlow
-maintainer: Simon Marlow <marlowsd@gmail.com>
-bug-reports: mailto:marlowsd@gmail.com
+copyright: (c) Input Output Global Ltd.
+author: Michael Fellinger
+      , Michael Bishop
+maintainer: Michael Fellinger <michael.fellinger@iohk.io>
+          , Michael Bishop <michael.bishop@iohk.io>
+bug-reports: mailto:michael.fellinger@iohk.io
 stability: stable
-homepage: http://www.haskell.org/hello/
+homepage: https://github.com/input-output-hk/nix-daemon-protocol
 synopsis: Hello World, an example package
 category: Console, Text
 cabal-version: >= 1.6
@@ -24,8 +26,8 @@ Description:
   improvements.
 
 source-repository head
-  type:     darcs
-  location: http://darcs.haskell.org/hello/
+  type:     git
+  location: https://github.com/input-output-hk/nix-daemon-protocol
 
 flag threaded
   default: False
